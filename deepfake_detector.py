@@ -18,6 +18,10 @@ test_fake_folder = "data/rvf10k/valid/fake"
 seed = 42
 batch_size = 32
 num_epochs = 10
+train_ratio = 0.8
+dropout_rate = 0.3
+learning_rate = 0.001
+momentum = 0.9
 
 
 # Dataset
@@ -42,6 +46,7 @@ class FaceDataset(Dataset):
 # Loading data
 
 
+# Loads all .jpg paths from the real and fake image folders and labels them
 def load_image_paths(real_folder, fake_folder):
     # real = 1, fake = 0
     all_images = []
@@ -65,20 +70,22 @@ def load_image_paths(real_folder, fake_folder):
     return all_images
 
 
-def split_data(all_images, train_ratio=0.8):
+# Shuffles and splits images into training and validation sets
+def split_data(all_images):
     np.random.seed(seed)
     np.random.shuffle(all_images)
 
     n = len(all_images)
     train_end = int(n * train_ratio)
 
-    train = all_images[:train_end]
-    val = all_images[train_end:]
+    train_data = all_images[:train_end]
+    val_data = all_images[train_end:]
 
-    print(f"Train: {len(train)}, Val: {len(val)}")
-    return train, val
+    print(f"Train: {len(train_data)}, Val: {len(val_data)}")
+    return train_data, val_data
 
 
+# Shows a few sample images to verify data loaded correctly
 def show_samples(images, n=8):
     for i in range(n):
         path, label = images[i]
@@ -90,6 +97,7 @@ def show_samples(images, n=8):
         plt.show()
 
 
+# Setup image transforms for training and evaluation
 def get_transforms():
     train_transform = transforms.Compose([
         transforms.Resize((224, 224)),
@@ -112,6 +120,7 @@ def get_transforms():
 # Model
 
 
+# Loads pretrained resnet-18, freezes all layers, then replaces final layer for binary classification
 def build_model():
     model = models.resnet18(weights='IMAGENET1K_V1')
 
@@ -119,7 +128,7 @@ def build_model():
     for param in model.parameters():
         param.requires_grad = False
 
-    model.fc = nn.Sequential(nn.Dropout(0.3), nn.Linear(model.fc.in_features, 1))
+    model.fc = nn.Sequential(nn.Dropout(dropout_rate), nn.Linear(model.fc.in_features, 1))
 
     return model
 
@@ -127,9 +136,10 @@ def build_model():
 # Training
 
 
+# Trains the model, tracks metrics for each epoch, then saves the best model by validation accuracy
 def train(model, train_loader, val_loader, device):
     loss_function = nn.BCEWithLogitsLoss()
-    optimizer = optim.SGD(model.fc.parameters(), lr=0.001, momentum=0.9)
+    optimizer = optim.SGD(model.fc.parameters(), lr=learning_rate, momentum=momentum)
 
     train_losses, val_losses = [], []
     train_accs, val_accs = [], []
@@ -183,6 +193,7 @@ def train(model, train_loader, val_loader, device):
     return history
 
 
+# Runs the model on a dataset without updating weights, returns loss and accuracy
 def evaluate(model, loader, loss_function, device):
     model.eval()
     total_loss = 0
@@ -203,6 +214,7 @@ def evaluate(model, loader, loss_function, device):
     return total_loss / total_pred, correct_pred / total_pred
 
 
+# Runs the model on the test dataset
 def get_predictions(model, test_loader, device):
     model.eval()
     all_probs = []
@@ -225,6 +237,7 @@ def get_predictions(model, test_loader, device):
     return np.array(all_probs), np.array(all_labels), all_paths
 
 
+# Plots training and validation loss/accuracy over epochs to check for overfitting
 def plot_training_curves(history):
     plt.figure()
     plt.plot(history["train_loss"], label="Train Loss")
@@ -245,6 +258,7 @@ def plot_training_curves(history):
     plt.show()
 
 
+# Plots ROC curve with AUC score and confusion matrix
 def plot_results(all_labels, all_probs, all_preds):
     fpr, tpr, thresholds = roc_curve(all_labels, all_probs)
     roc_auc = auc(fpr, tpr)
@@ -259,10 +273,103 @@ def plot_results(all_labels, all_probs, all_preds):
     plt.show()
 
     cm = confusion_matrix(all_labels, all_preds)
-    plt.figure()
     ConfusionMatrixDisplay(cm, display_labels=["Fake", "Real"]).plot()
     plt.title("Confusion Matrix")
     plt.show()
+
+
+# Plots histogram of predicted probabilities for real vs fake images
+def plot_confidence(all_labels, all_probs):
+    real_probs, fake_probs = [], []
+
+    for i in range(len(all_labels)):
+        if all_labels[i] == 1:
+            real_probs.append(all_probs[i])
+        else:
+            fake_probs.append(all_probs[i])
+
+    plt.figure()
+    plt.hist(real_probs, bins=20, alpha=0.5, label="Real")
+    plt.hist(fake_probs, bins=20, alpha=0.5, label="Fake")
+    plt.xlabel("Predicted Probability")
+    plt.ylabel("Count")
+    plt.title("Confidence Distribution")
+    plt.legend()
+    #plt.savefig("figures/confidence_distribution.png")
+    plt.show()
+
+
+# Tests different decision thresholds to see how the accuracy, precision, and recall change
+def analyze_thresholds(all_labels, all_probs):
+    thresholds = [0.3, 0.4, 0.5, 0.6, 0.7]
+
+    accuracies, precisions, recalls = [], [], []
+
+    for t in thresholds:
+        preds = (all_probs > t).astype(int)
+
+        correct, true_real, pred_real, actual_real = 0,0,0,0
+
+        for i in range(len(all_labels)):
+            if preds[i] == all_labels[i]:
+                correct += 1
+            if preds[i] == 1:
+                pred_real += 1
+                if all_labels[i] == 1:
+                    true_real += 1
+            if all_labels[i] == 1:
+                actual_real += 1
+
+        acc = correct / len(all_labels)
+        if pred_real > 0:
+            prec = true_real / pred_real
+        else:
+            prec = 0
+        if actual_real > 0:
+            rec = true_real / actual_real
+        else:
+            rec = 0
+
+        accuracies.append(acc)
+        precisions.append(prec)
+        recalls.append(rec)
+
+        print(f"Threshold {t:.1f} - Accuracy: {acc:.3f}, Precision: {prec:.3f}, Recall: {rec:.3f}")
+
+    plt.figure()
+    plt.plot(thresholds, accuracies, label="Accuracy")
+    plt.plot(thresholds, precisions, label="Precision")
+    plt.plot(thresholds, recalls, label="Recall")
+    plt.xlabel("Threshold")
+    plt.ylabel("Score")
+    plt.title("Metrics vs Threshold")
+    plt.legend()
+    plt.show()
+
+
+# Sorts misclassified images by confidence to display the worst mistakes
+def analyze_errors(all_labels, all_probs, all_preds, all_paths):
+    mistakes = []
+    for i in range(len(all_labels)):
+        if all_preds[i] != all_labels[i]:
+            mistakes.append((all_paths[i], all_labels[i], all_probs[i]))
+
+    print(f"Mistakes: {len(mistakes) / len(all_labels)}")
+
+    # sort by confidence on both extremes
+    mistakes.sort(key = lambda x: abs(x[2] - 0.5), reverse = True)
+
+    print("\nMost confident mistakes:")
+    for mistake in mistakes[:10]:
+        path, true_label, prob = mistake
+        true_class = "Real" if true_label == 1 else "Fake"
+        pred_class = "Real" if prob > 0.5 else "Fake"
+        print(f" {path} - Truth: {true_class}, Pred: {pred_class}, Prob: {prob:.3f}")
+        img = Image.open(path)
+        plt.figure()
+        plt.imshow(img)
+        plt.title(f"Truth: {true_class}, Pred: {pred_class}, Prob: {prob:.3f}")
+        plt.show()
 
 
 def main():
@@ -296,9 +403,13 @@ def main():
     all_probs, all_labels, all_paths = get_predictions(model, test_loader, device)
     all_preds = (all_probs > 0.5).astype(int)
 
+    # Results analysis
     print(classification_report(all_labels, all_preds, target_names=["Fake", "Real"]))
     plot_results(all_labels, all_probs, all_preds)
 
+    plot_confidence(all_labels, all_probs)
+    analyze_thresholds(all_labels, all_probs)
+    analyze_errors(all_labels, all_probs, all_preds, all_paths)
 
 if __name__ == '__main__':
     main()
